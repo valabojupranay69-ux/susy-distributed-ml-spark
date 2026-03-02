@@ -1,0 +1,4 @@
+dataset,rows,shuffle_partitions,train_time_seconds
+100k_sample,100000,200,23.420825958251953
+~1m_sample_fraction0.20,~1,000,000,200,21.48917508125305
+5m_full_nocache,5000000,200,116.1109790802002

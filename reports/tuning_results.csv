@@ -1,0 +1,3 @@
+model,grid_size,folds,parallelism,test_roc_auc,seconds
+logreg_cv,9,3,4,0.8569481667028508,42.744038105010986
+gbt_cv,8,3,4,0.867421618714654,177.54683184623718
