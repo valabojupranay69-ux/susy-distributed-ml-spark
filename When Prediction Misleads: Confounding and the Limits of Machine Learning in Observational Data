@@ -1,0 +1,109 @@
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from sklearn.ensemble import GradientBoostingRegressor, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import KFold, train_test_split
+from sklearn.metrics import mean_squared_error, r2_score
+from causaldata import nsw_mixtape, cps_mixtape
+
+warnings.filterwarnings("ignore")
+COV = ["age", "educ", "black", "hisp", "marr", "nodegree", "re74", "re75"]
+exp = nsw_mixtape.load_pandas().data.copy()      # randomized experiment = truth
+cps = cps_mixtape.load_pandas().data.copy()      # non-randomized controls
+obs = pd.concat([exp[exp.treat == 1], cps], ignore_index=True)
+
+TRUTH = exp.loc[exp.treat == 1, "re78"].mean() - exp.loc[exp.treat == 0, "re78"].mean()
+X = obs[COV].values
+T = obs["treat"].values.astype(int)
+Y = obs["re78"].values
+print(f"observational rows: {len(obs):,} | experimental rows: {len(exp):,}")
+
+XT = np.column_stack([X, T])
+Xtr, Xte, Ytr, Yte = train_test_split(XT, Y, test_size=0.3, random_state=0)
+pred = GradientBoostingRegressor(random_state=0).fit(Xtr, Ytr)
+rmse = np.sqrt(mean_squared_error(Yte, pred.predict(Xte)))
+r2 = r2_score(Yte, pred.predict(Xte))
+
+# S-learner: predict everyone twice (treated / untreated) and average the gap
+full = GradientBoostingRegressor(random_state=0).fit(XT, Y)
+naive = (full.predict(np.column_stack([X, np.ones_like(T)])) -
+         full.predict(np.column_stack([X, np.zeros_like(T)]))).mean()
+def manual_dml(X, T, Y, K=5, seed=0):
+    """DML: model out Y and T from X, then regress the residuals."""
+    n = len(Y)
+    y_res = np.zeros(n)
+    t_res = np.zeros(n)
+    kf = KFold(n_splits=K, shuffle=True, random_state=seed)
+    for tr, te in kf.split(X):                       # cross-fitting
+        m_y = GradientBoostingRegressor(random_state=seed).fit(X[tr], Y[tr])
+        m_t = GradientBoostingClassifier(random_state=seed).fit(X[tr], T[tr])
+        y_res[te] = Y[te] - m_y.predict(X[te])       # outcome residual
+        t_res[te] = T[te] - m_t.predict_proba(X[te])[:, 1]   # treatment residual
+    theta = (t_res @ y_res) / (t_res @ t_res)        # the causal effect
+    eps = y_res - theta * t_res
+    se = np.sqrt((eps**2 @ t_res**2) / (t_res @ t_res)**2)
+    return theta, theta - 1.96*se, theta + 1.96*se
+prop = LogisticRegression(max_iter=2000).fit(X, T).predict_proba(X)[:, 1]
+mask = (prop >= prop[T == 1].min()) & (prop <= prop[T == 1].max())
+Xt, Tt, Yt = X[mask], T[mask], Y[mask]
+
+ate, lo, hi = manual_dml(Xt, Tt, Yt)      # correct: trimmed
+ate_raw, _, _ = manual_dml(X, T, Y)       # comparison: untrimmed
+covers = "Yes" if lo <= TRUTH <= hi else "No"
+
+print("=" * 62)
+print(f"(1) PREDICTIVE PRECISION:  RMSE {rmse:,.0f}   R^2 {r2:.3f}")
+print("=" * 62)
+print("(2) CAUSAL PRECISION (distance from experimental truth)")
+print(f"    Experimental truth        : {TRUTH:+,.0f}")
+print(f"    {'Method':<28}{'Estimate':>10}{'Error':>9}{'Covers?':>9}")
+print(f"    {'Naive predictive':<28}{naive:>+10,.0f}{abs(naive-TRUTH):>9,.0f}{'n/a':>9}")
+print(f"    {'Double ML (no trimming)':<28}{ate_raw:>+10,.0f}{abs(ate_raw-TRUTH):>9,.0f}{'--':>9}")
+print(f"    {'Double ML (common support)':<28}{ate:>+10,.0f}{abs(ate-TRUTH):>9,.0f}{covers:>9}")
+print(f"    Double ML 95% CI          : [{lo:,.0f}, {hi:,.0f}]")
+print("=" * 62)
+print(f"Rows: {len(T):,} total, {mask.sum():,} kept after trimming.")
+
+# Figure 1: the groups differ before treatment (this is the confounding)
+plt.figure(figsize=(7, 4))
+mt = obs[obs.treat == 1][["re74", "re75"]].mean()
+mc = obs[obs.treat == 0][["re74", "re75"]].mean()
+xp = np.arange(2); w = 0.35
+plt.bar(xp - w/2, mt, w, label="Treated (NSW)", color="#d95f02")
+plt.bar(xp + w/2, mc, w, label="Control (CPS)", color="#7570b3")
+plt.xticks(xp, ["Earnings 1974", "Earnings 1975"])
+plt.ylabel("Mean earnings ($)")
+plt.title("Figure 1. Pre-treatment earnings differ between groups")
+plt.legend(); plt.tight_layout()
+plt.savefig("fig1_imbalance.png", dpi=160); plt.show()
+
+# Figure 2: propensity overlap
+plt.figure(figsize=(7, 4))
+plt.hist(prop[T == 0], bins=50, alpha=0.6, label="Control (CPS)", color="#7570b3", log=True)
+plt.hist(prop[T == 1], bins=50, alpha=0.7, label="Treated (NSW)", color="#d95f02", log=True)
+plt.xlabel("Estimated propensity score"); plt.ylabel("Count (log scale)")
+plt.title("Figure 2. Most controls are not comparable")
+plt.legend(); plt.tight_layout()
+plt.savefig("fig2_overlap.png", dpi=160); plt.show()
+
+# Figure 3: estimates vs the truth
+plt.figure(figsize=(7.5, 4.5))
+methods = ["Naive predictive", "Double ML\n(no trimming)", "Double ML\n(common support)"]
+vals = [naive, ate_raw, ate]
+colors = ["#c0392b", "#e67e22", "#27ae60"]
+bars = plt.bar(methods, vals, color=colors, alpha=0.85)
+plt.errorbar([2], [ate], yerr=[[ate - lo], [hi - ate]], fmt="none", ecolor="black", capsize=6)
+plt.axhline(TRUTH, ls="--", color="black", lw=1.5, label=f"Experimental truth (+{TRUTH:,.0f})")
+plt.axhline(0, color="grey", lw=0.8)
+plt.ylabel("Estimated effect on 1978 earnings ($)")
+plt.title("Figure 3. The naive model is confidently wrong")
+plt.legend()
+for b, v in zip(bars, vals):
+    plt.text(b.get_x() + b.get_width()/2, v + (200 if v > 0 else -500),
+             f"{v:+,.0f}", ha="center", fontsize=9)
+plt.tight_layout()
+plt.savefig("fig3_estimates.png", dpi=160); plt.show()
+
+print("Saved: fig1_imbalance.png, fig2_overlap.png, fig3_estimates.png")
